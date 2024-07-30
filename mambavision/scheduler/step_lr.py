@@ -1,63 +1,98 @@
-""" Step Scheduler
+import tensorflow as tf
+import numpy as np
 
-Basic step LR schedule with warmup, noise.
-
-Hacked together by / Copyright 2020 Ross Wightman
-"""
-import math
-import torch
-
-from .scheduler import Scheduler
-
-
-class StepLRScheduler(Scheduler):
+class StepLRScheduler(tf.keras.optimizers.schedules.LearningRateSchedule):
     """
+    Step Learning Rate Scheduler with warmup and optional noise.
     """
 
     def __init__(self,
-                 optimizer: torch.optim.Optimizer,
+                 initial_learning_rate: float,
                  decay_t: float,
-                 decay_rate: float = 1.,
-                 warmup_t=0,
-                 warmup_lr_init=0,
-                 t_in_epochs=True,
+                 decay_rate: float = 1.0,
+                 warmup_t: int = 0,
+                 warmup_lr_init: float = 0.0,
+                 t_in_epochs: bool = True,
                  noise_range_t=None,
                  noise_pct=0.67,
                  noise_std=1.0,
-                 noise_seed=42,
-                 initialize=True,
+                 noise_seed: int = 42,
                  ) -> None:
-        super().__init__(
-            optimizer, param_group_field="lr",
-            noise_range_t=noise_range_t, noise_pct=noise_pct, noise_std=noise_std, noise_seed=noise_seed,
-            initialize=initialize)
-
+        super(StepLRScheduler, self).__init__()
+        self.initial_learning_rate = initial_learning_rate
         self.decay_t = decay_t
         self.decay_rate = decay_rate
         self.warmup_t = warmup_t
         self.warmup_lr_init = warmup_lr_init
         self.t_in_epochs = t_in_epochs
-        if self.warmup_t:
-            self.warmup_steps = [(v - warmup_lr_init) / self.warmup_t for v in self.base_values]
-            super().update_groups(self.warmup_lr_init)
-        else:
-            self.warmup_steps = [1 for _ in self.base_values]
+        self.noise_range_t = noise_range_t
+        self.noise_pct = noise_pct
+        self.noise_std = noise_std
+        self.noise_seed = noise_seed
+        self.rng = np.random.default_rng(seed=self.noise_seed)
 
-    def _get_lr(self, t):
-        if t < self.warmup_t:
-            lrs = [self.warmup_lr_init + t * s for s in self.warmup_steps]
+        if self.warmup_t > 0:
+            self.warmup_steps = [(self.initial_learning_rate - warmup_lr_init) / self.warmup_t]
         else:
-            lrs = [v * (self.decay_rate ** (t // self.decay_t)) for v in self.base_values]
-        return lrs
+            self.warmup_steps = [1.0]
 
-    def get_epoch_values(self, epoch: int):
+    def __call__(self, step: int) -> float:
         if self.t_in_epochs:
-            return self._get_lr(epoch)
+            return self.get_epoch_values(step)
         else:
-            return None
+            return self.get_update_values(step)
 
-    def get_update_values(self, num_updates: int):
-        if not self.t_in_epochs:
-            return self._get_lr(num_updates)
+    def get_epoch_values(self, epoch: int) -> float:
+        if epoch < self.warmup_t:
+            lr = self.warmup_lr_init + epoch * self.warmup_steps[0]
         else:
-            return None
+            lr = self.initial_learning_rate * (self.decay_rate ** (epoch // self.decay_t))
+        return self._add_noise(lr, epoch)
+
+    def get_update_values(self, num_updates: int) -> float:
+        if num_updates < self.warmup_t:
+            lr = self.warmup_lr_init + num_updates * self.warmup_steps[0]
+        else:
+            lr = self.initial_learning_rate * (self.decay_rate ** (num_updates // self.decay_t))
+        return self._add_noise(lr, num_updates)
+
+    def _add_noise(self, lr: float, t: int) -> float:
+        if self._is_apply_noise(t):
+            noise = self._calculate_noise(t)
+            lr += lr * noise
+        return lr
+
+    def _is_apply_noise(self, t: int) -> bool:
+        """Return True if scheduler is in noise range."""
+        if self.noise_range_t is not None:
+            if isinstance(self.noise_range_t, (list, tuple)):
+                return self.noise_range_t[0] <= t < self.noise_range_t[1]
+            else:
+                return t >= self.noise_range_t
+        return False
+
+    def _calculate_noise(self, t: int) -> float:
+        self.rng = np.random.default_rng(seed=self.noise_seed + t)
+        if self.noise_std > 0:
+            if self.noise_pct > 0:
+                while True:
+                    noise = self.rng.normal(0, self.noise_std)
+                    if abs(noise) < self.noise_pct:
+                        return noise
+            else:
+                return self.rng.normal(0, self.noise_std)
+        return 0.0
+
+    def get_config(self):
+        return {
+            'initial_learning_rate': self.initial_learning_rate,
+            'decay_t': self.decay_t,
+            'decay_rate': self.decay_rate,
+            'warmup_t': self.warmup_t,
+            'warmup_lr_init': self.warmup_lr_init,
+            't_in_epochs': self.t_in_epochs,
+            'noise_range_t': self.noise_range_t,
+            'noise_pct': self.noise_pct,
+            'noise_std': self.noise_std,
+            'noise_seed': self.noise_seed
+        }

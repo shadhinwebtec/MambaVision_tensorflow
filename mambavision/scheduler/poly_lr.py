@@ -1,54 +1,29 @@
-""" Polynomial Scheduler
-
-Polynomial LR schedule with warmup, noise.
-
-Hacked together by / Copyright 2021 Ross Wightman
-"""
+import tensorflow as tf
+import numpy as np
 import math
-import logging
 
-import torch
-
-from .scheduler import Scheduler
-
-
-_logger = logging.getLogger(__name__)
-
-
-class PolyLRScheduler(Scheduler):
-    """ Polynomial LR Scheduler w/ warmup, noise, and k-decay
-
-    k-decay option based on `k-decay: A New Method For Learning Rate Schedule` - https://arxiv.org/abs/2004.05909
-    """
+class PolyLRScheduler(tf.keras.optimizers.schedules.LearningRateSchedule):
+    """Polynomial LR Scheduler with warmup, noise, and k-decay."""
 
     def __init__(self,
-                 optimizer: torch.optim.Optimizer,
-                 t_initial: int,
-                 power: float = 0.5,
-                 lr_min: float = 0.,
-                 cycle_mul: float = 1.,
-                 cycle_decay: float = 1.,
-                 cycle_limit: int = 1,
+                 initial_learning_rate,
+                 t_initial,
+                 power=0.5,
+                 lr_min=0.0,
+                 cycle_mul=1.0,
+                 cycle_decay=1.0,
+                 cycle_limit=1,
                  warmup_t=0,
-                 warmup_lr_init=0,
+                 warmup_lr_init=0.0,
                  warmup_prefix=False,
                  t_in_epochs=True,
                  noise_range_t=None,
                  noise_pct=0.67,
                  noise_std=1.0,
                  noise_seed=42,
-                 k_decay=1.0,
-                 initialize=True) -> None:
-        super().__init__(
-            optimizer, param_group_field="lr",
-            noise_range_t=noise_range_t, noise_pct=noise_pct, noise_std=noise_std, noise_seed=noise_seed,
-            initialize=initialize)
-
-        assert t_initial > 0
-        assert lr_min >= 0
-        if t_initial == 1 and cycle_mul == 1 and cycle_decay == 1:
-            _logger.warning("Cosine annealing scheduler will have no effect on the learning "
-                            "rate since t_initial = t_mul = eta_mul = 1.")
+                 k_decay=1.0):
+        super(PolyLRScheduler, self).__init__()
+        self.initial_learning_rate = initial_learning_rate
         self.t_initial = t_initial
         self.power = power
         self.lr_min = lr_min
@@ -59,19 +34,32 @@ class PolyLRScheduler(Scheduler):
         self.warmup_lr_init = warmup_lr_init
         self.warmup_prefix = warmup_prefix
         self.t_in_epochs = t_in_epochs
+        self.noise_range_t = noise_range_t
+        self.noise_pct = noise_pct
+        self.noise_std = noise_std
+        self.noise_seed = noise_seed
         self.k_decay = k_decay
-        if self.warmup_t:
-            self.warmup_steps = [(v - warmup_lr_init) / self.warmup_t for v in self.base_values]
-            super().update_groups(self.warmup_lr_init)
+        self.rng = np.random.default_rng(seed=noise_seed)
+
+        self.warmup_steps = []
+        if warmup_t > 0:
+            self.warmup_steps = [
+                (self.initial_learning_rate - warmup_lr_init) / warmup_t
+            ]
         else:
-            self.warmup_steps = [1 for _ in self.base_values]
+            self.warmup_steps = [1.0]
+
+    def __call__(self, step):
+        if self.t_in_epochs:
+            return self._get_lr(step)
+        return None
 
     def _get_lr(self, t):
         if t < self.warmup_t:
-            lrs = [self.warmup_lr_init + t * s for s in self.warmup_steps]
+            lrs = self.warmup_lr_init + t * self.warmup_steps[0]
         else:
             if self.warmup_prefix:
-                t = t - self.warmup_t
+                t -= self.warmup_t
 
             if self.cycle_mul != 1:
                 i = math.floor(math.log(1 - t / self.t_initial * (1 - self.cycle_mul), self.cycle_mul))
@@ -83,34 +71,45 @@ class PolyLRScheduler(Scheduler):
                 t_curr = t - (self.t_initial * i)
 
             gamma = self.cycle_decay ** i
-            lr_max_values = [v * gamma for v in self.base_values]
+            lr_max = self.initial_learning_rate * gamma
             k = self.k_decay
 
             if i < self.cycle_limit:
-                lrs = [
-                    self.lr_min + (lr_max - self.lr_min) * (1 - t_curr ** k / t_i ** k) ** self.power
-                    for lr_max in lr_max_values
-                ]
+                lrs = self.lr_min + (lr_max - self.lr_min) * (1 - (t_curr ** k / t_i ** k)) ** self.power
             else:
-                lrs = [self.lr_min for _ in self.base_values]
+                lrs = self.lr_min
+
+        if self.noise_range_t and self.noise_range_t[0] <= t <= self.noise_range_t[1]:
+            lrs += self._apply_noise(t)
 
         return lrs
 
-    def get_epoch_values(self, epoch: int):
-        if self.t_in_epochs:
-            return self._get_lr(epoch)
-        else:
-            return None
+    def _apply_noise(self, t):
+        if self.noise_type == 'normal':
+            return self.rng.normal(0, self.noise_std) * self.noise_pct
+        elif self.noise_type == 'uniform':
+            return self.rng.uniform(-self.noise_pct, self.noise_pct)
+        return 0
 
-    def get_update_values(self, num_updates: int):
-        if not self.t_in_epochs:
-            return self._get_lr(num_updates)
-        else:
-            return None
+    def get_config(self):
+        return {
+            "initial_learning_rate": self.initial_learning_rate,
+            "t_initial": self.t_initial,
+            "power": self.power,
+            "lr_min": self.lr_min,
+            "cycle_mul": self.cycle_mul,
+            "cycle_decay": self.cycle_decay,
+            "cycle_limit": self.cycle_limit,
+            "warmup_t": self.warmup_t,
+            "warmup_lr_init": self.warmup_lr_init,
+            "warmup_prefix": self.warmup_prefix,
+            "t_in_epochs": self.t_in_epochs,
+            "noise_range_t": self.noise_range_t,
+            "noise_pct": self.noise_pct,
+            "noise_std": self.noise_std,
+            "noise_seed": self.noise_seed,
+            "k_decay": self.k_decay,
+        }
 
-    def get_cycle_length(self, cycles=0):
-        cycles = max(1, cycles or self.cycle_limit)
-        if self.cycle_mul == 1.0:
-            return self.t_initial * cycles
-        else:
-            return int(math.floor(-self.t_initial * (self.cycle_mul ** cycles - 1) / (1 - self.cycle_mul)))
+
+

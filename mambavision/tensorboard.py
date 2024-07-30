@@ -1,9 +1,8 @@
-import torch
-from tensorboardX import SummaryWriter
+import tensorflow as tf
 
-class TensorboardLogger(object):
+class TensorboardLogger:
     def __init__(self, log_dir):
-        self.writer = SummaryWriter(logdir=log_dir)
+        self.writer = tf.summary.create_file_writer(log_dir)
         self.step = 0
 
     def set_step(self, step=None):
@@ -13,13 +12,15 @@ class TensorboardLogger(object):
             self.step += 1
 
     def update(self, head='scalar', step=None, **kwargs):
-        for k, v in kwargs.items():
-            if v is None:
-                continue
-            if isinstance(v, torch.Tensor):
-                v = v.item()
-            assert isinstance(v, (float, int))
-            self.writer.add_scalar(head + "/" + k, v, self.step if step is None else step)
+        with self.writer.as_default():
+            for k, v in kwargs.items():
+                if v is None:
+                    continue
+                if isinstance(v, tf.Tensor):
+                    v = v.numpy()
+                assert isinstance(v, (float, int))
+                tf.summary.scalar(name=head + "/" + k, data=v, step=self.step if step is None else step)
+        self.writer.flush()
 
     def flush(self):
         self.writer.flush()
